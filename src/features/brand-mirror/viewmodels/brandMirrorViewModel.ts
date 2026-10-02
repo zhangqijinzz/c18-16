@@ -1,12 +1,20 @@
-import { clampTokenValues, cloneTokens, contrastRatio, normalizeColor, themeTokens, validateTokens } from '../domain/brandRules'
+import { clampTokenValues, cloneOverrides, cloneTokens, contrastRatio, customizedGroups, customizedGroupLabels, normalizeColor, pruneOverrides, resolveTokens, validateTokens } from '../domain/brandRules'
 import type { BrandRepository } from '../repositories/brandRepository'
 import type { BrandGuidelinesExporter } from '../services/exportService'
-import { INITIAL_TOKENS, type BrandDocument, type BrandMirrorSnapshot, type BrandTheme, type SavedVersion } from '../models/brandMirrorModels'
+import { THEME_PRESETS, TOKEN_GROUP_LABELS, type BrandDocument, type BrandMirrorSnapshot, type BrandTheme, type SavedVersion, type TokenColorField, type TokenGroupKey, type TokenOverrides, type TokenScaleField } from '../models/brandMirrorModels'
 
 type Listener = () => void
 
+const EMPTY_OVERRIDES: TokenOverrides = {}
+
 export class BrandMirrorViewModel {
-  private snapshot: BrandMirrorSnapshot = this.makeSnapshot({ tokens: INITIAL_TOKENS, theme: 'studio', versions: [] })
+  private theme: BrandTheme = 'studio'
+  private overrides: TokenOverrides = EMPTY_OVERRIDES
+  private versions: SavedVersion[] = []
+  private pendingTheme: BrandTheme | null = null
+  private compareMode = false
+  private status: BrandMirrorSnapshot['status'] = 'loading'
+  private message = ''
   private readonly listeners = new Set<Listener>()
   private readonly repository: BrandRepository
   private readonly exporter?: BrandGuidelinesExporter
@@ -22,100 +30,178 @@ export class BrandMirrorViewModel {
   }
 
   getSnapshot(): BrandMirrorSnapshot {
-    return this.snapshot
+    const tokens = resolveTokens(this.theme, this.overrides)
+    const ratio = contrastRatio(tokens.primary, tokens.secondary)
+    const latestVersion = this.versions[this.versions.length - 1]
+    return {
+      status: this.status,
+      tokens,
+      theme: this.theme,
+      overrides: cloneOverrides(this.overrides),
+      customizedGroups: customizedGroups(this.theme, this.overrides),
+      pendingTheme: this.pendingTheme,
+      versions: this.versions,
+      compareMode: this.compareMode,
+      activeVersionId: latestVersion?.id ?? null,
+      contrastRatio: ratio,
+      contrastWarning: ratio < 3,
+      message: this.message,
+    }
   }
 
   initialize(): void {
     const stored = this.repository.load()
     if (stored) {
-      this.snapshot = this.makeSnapshot(stored, '已恢复最近一次工作状态')
+      this.theme = stored.theme
+      this.overrides = pruneOverrides(stored.theme, stored.overrides)
+      this.versions = stored.versions
+      this.pendingTheme = null
+      this.compareMode = false
+      this.status = 'ready'
+      this.message = '已恢复最近一次工作状态'
     } else {
-      this.snapshot = this.makeSnapshot({ tokens: INITIAL_TOKENS, theme: 'studio', versions: [] }, '从 Studio warm 开始探索')
+      this.theme = 'studio'
+      this.overrides = EMPTY_OVERRIDES
+      this.versions = []
+      this.status = 'ready'
+      this.message = '从 Studio warm 开始探索'
     }
     this.emit()
   }
 
-  selectTheme(theme: BrandTheme): void {
-    this.update({ tokens: themeTokens(theme), theme }, '已切换基础主题')
+  /**
+   * 主题只是“起点”：
+   * - 没有自定义调整时直接切换；
+   * - 有自定义调整时先挂起主题、由界面确认，用户可选择保留或放弃调整。
+   */
+  requestThemeChange(theme: BrandTheme): void {
+    if (theme === this.theme) return
+    if (customizedGroups(this.theme, this.overrides).length === 0) {
+      this.commitThemeChange(theme, false)
+      return
+    }
+    this.pendingTheme = theme
+    this.status = 'editing'
+    this.message = `切换到 ${THEME_PRESETS[theme].label}：保留你的调整，或改用该主题默认`
+    this.emit()
   }
 
-  updateColor(field: 'primary' | 'secondary', value: string): void {
+  confirmThemeChange(keepAdjustments: boolean): void {
+    const theme = this.pendingTheme
+    if (!theme) return
+    this.commitThemeChange(theme, keepAdjustments)
+  }
+
+  cancelThemeChange(): void {
+    if (!this.pendingTheme) return
+    this.pendingTheme = null
+    this.message = '已取消切换，仍停留在当前主题'
+    this.emit()
+  }
+
+  updateColor(field: TokenColorField, value: string): void {
     const color = normalizeColor(value)
-    this.update({ tokens: { ...this.snapshot.tokens, [field]: color } }, '令牌已更新')
+    this.apply({ ...this.overrides, [field]: color }, '令牌已更新')
   }
 
-  updateScale(field: 'radiusScale' | 'spacingScale' | 'typeScale', index: number, value: number): void {
-    const values = [...this.snapshot.tokens[field]]
+  updateScale(field: TokenScaleField, index: number, value: number): void {
+    const current = resolveTokens(this.theme, this.overrides)[field]
+    const values = [...current]
     values[index] = Number.isFinite(value) ? value : values[index]
-    this.update({ tokens: clampTokenValues({ ...this.snapshot.tokens, [field]: values }) }, '令牌已更新')
+    // 先在完整令牌上夹紧，再以夹紧后的整组写回覆盖层
+    const clamped = clampTokenValues({ ...resolveTokens(this.theme, this.overrides), [field]: values })
+    this.apply({ ...this.overrides, [field]: clamped[field] }, '令牌已更新')
   }
 
-  reset(): void {
-    this.update({ tokens: cloneTokens(INITIAL_TOKENS), theme: 'studio' }, '已恢复默认令牌')
+  /** 只重置某一组（颜色 / 圆角 / 间距 / 字体）回到当前主题默认，其余调整保留。 */
+  resetGroup(group: TokenGroupKey): void {
+    let next: TokenOverrides
+    if (group === 'color') {
+      next = { ...this.overrides }
+      delete next.primary
+      delete next.secondary
+    } else {
+      next = { ...this.overrides }
+      delete next[group]
+    }
+    this.apply(next, `「${TOKEN_GROUP_LABELS[group]}」已恢复为 ${THEME_PRESETS[this.theme].label} 默认`)
+  }
+
+  /** 全部回到当前主题默认（不切换主题）。 */
+  resetAll(): void {
+    this.apply(EMPTY_OVERRIDES, `所有调整已清除，回到 ${THEME_PRESETS[this.theme].label} 默认`)
   }
 
   saveVersion(): void {
-    const validationError = validateTokens(this.snapshot.tokens)
+    const tokens = resolveTokens(this.theme, this.overrides)
+    const validationError = validateTokens(tokens)
     if (validationError) {
-      this.snapshot = { ...this.snapshot, status: 'error', message: validationError }
+      this.status = 'error'
+      this.message = validationError
       this.emit()
       return
     }
     const nextVersion: SavedVersion = {
       id: `version-${Date.now()}`,
-      label: this.snapshot.versions.length === 0 ? 'Version A' : `Version ${String.fromCharCode(65 + this.snapshot.versions.length)}`,
-      tokens: cloneTokens(this.snapshot.tokens),
+      label: this.versions.length === 0 ? 'Version A' : `Version ${String.fromCharCode(65 + this.versions.length)}`,
+      tokens: cloneTokens(tokens),
+      theme: this.theme,
+      customizedGroups: customizedGroups(this.theme, this.overrides),
       createdAt: new Date().toISOString(),
     }
-    const versions = [...this.snapshot.versions, nextVersion]
-    this.persist({ tokens: this.snapshot.tokens, theme: this.snapshot.theme, versions }, '版本已保存')
+    this.versions = [...this.versions, nextVersion]
+    this.persist('版本已保存', 'ready')
   }
 
   toggleCompare(): void {
-    this.snapshot = { ...this.snapshot, compareMode: !this.snapshot.compareMode, message: this.snapshot.compareMode ? '已退出对比模式' : '正在对比最近两个版本' }
+    this.compareMode = !this.compareMode
+    this.message = this.compareMode ? '正在对比最近两个版本' : '已退出对比模式'
     this.emit()
   }
 
   exportBrandGuidelines(): void {
     if (!this.exporter) return
     try {
-      this.exporter.export(this.snapshot)
-      this.snapshot = { ...this.snapshot, message: '品牌规范已导出' }
+      this.exporter.export(this.getSnapshot())
+      this.message = '品牌规范已导出'
     } catch {
-      this.snapshot = { ...this.snapshot, status: 'error', message: '导出失败，请稍后重试' }
+      this.status = 'error'
+      this.message = '导出失败，请稍后重试'
     }
     this.emit()
   }
 
-  private update(partial: Partial<Pick<BrandDocument, 'tokens' | 'theme'>>, message: string): void {
-    const tokens = partial.tokens ?? this.snapshot.tokens
-    this.snapshot = this.makeSnapshot({ tokens, theme: partial.theme ?? this.snapshot.theme, versions: this.snapshot.versions }, message, 'editing')
-    this.persistCurrent()
+  private commitThemeChange(theme: BrandTheme, keepAdjustments: boolean): void {
+    this.theme = theme
+    this.pendingTheme = null
+    // 保留时把恰好等于新主题默认值的覆盖项剔除，让其明确“跟随主题”
+    this.overrides = keepAdjustments ? pruneOverrides(theme, this.overrides) : EMPTY_OVERRIDES
+    const labels = customizedGroupLabels(theme, this.overrides)
+    this.message = keepAdjustments
+      ? (labels.length > 0
+          ? `已切换到 ${THEME_PRESETS[theme].label}，保留你的调整：${labels.join('、')}`
+          : `已切换到 ${THEME_PRESETS[theme].label}，你的调整与新主题默认一致，已全部跟随主题`)
+      : `已切换到 ${THEME_PRESETS[theme].label}，全部使用主题默认`
+    this.persist(this.message, 'editing')
   }
 
-  private persistCurrent(): void {
+  private apply(overrides: TokenOverrides, message: string): void {
+    this.overrides = pruneOverrides(this.theme, overrides)
+    this.persist(message, 'editing')
+  }
+
+  private persist(message: string, status: BrandMirrorSnapshot['status']): void {
+    const tokens = resolveTokens(this.theme, this.overrides)
     try {
-      this.repository.save({ version: 1, tokens: this.snapshot.tokens, theme: this.snapshot.theme, versions: this.snapshot.versions })
+      const document: BrandDocument = { version: 1, tokens, theme: this.theme, overrides: cloneOverrides(this.overrides), versions: this.versions }
+      this.repository.save(document)
+      this.status = status
+      this.message = message
     } catch {
-      this.snapshot = { ...this.snapshot, status: 'error', message: '本地保存失败，但当前编辑仍保留在页面中' }
+      this.status = 'error'
+      this.message = '本地保存失败，但当前编辑仍保留在页面中'
     }
     this.emit()
-  }
-
-  private persist(document: Omit<BrandDocument, 'version'>, message: string): void {
-    try {
-      this.repository.save({ version: 1, ...document })
-      this.snapshot = this.makeSnapshot(document, message, 'ready')
-    } catch {
-      this.snapshot = { ...this.snapshot, status: 'error', message: '版本保存失败，请稍后重试' }
-    }
-    this.emit()
-  }
-
-  private makeSnapshot(document: Omit<BrandDocument, 'version'>, message = '', status: BrandMirrorSnapshot['status'] = 'ready'): BrandMirrorSnapshot {
-    const ratio = contrastRatio(document.tokens.primary, document.tokens.secondary)
-    const latestVersion = document.versions[document.versions.length - 1]
-    return { status, tokens: cloneTokens(document.tokens), theme: document.theme, versions: document.versions, compareMode: false, activeVersionId: latestVersion?.id ?? null, contrastRatio: ratio, contrastWarning: ratio < 3, message }
   }
 
   private emit(): void {
